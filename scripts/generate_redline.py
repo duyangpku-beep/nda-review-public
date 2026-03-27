@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 """
-generate_redline.py — Generate Word track-changes DOCX from NDA review output.
+generate_redline.py — Apply Word track-changes to NDA source document in-place.
 
-Uses python-docx + lxml to produce proper w:ins / w:del XML so counterparties
-can accept/reject individual changes in Word's Review mode.
+Opens the source DOCX and for each issue locates the original text in paragraphs,
+then replaces it with w:del + w:ins XML so the counterparty can accept/reject each
+change in Word's Review mode.
 
 Usage:
   python3 generate_redline.py --source path/to/nda.docx --issues issues.json
-  python3 generate_redline.py --source path/to/nda.docx --interactive
+  python3 generate_redline.py --source path/to/nda.docx --all-standard
 
 Environment:
   NDA_SKILL_REVIEWER_NAME  — Author name shown in track changes (default: "Reviewer")
@@ -16,7 +17,6 @@ Environment:
 import argparse
 import json
 import os
-import re
 import sys
 from datetime import date
 from pathlib import Path
@@ -25,7 +25,7 @@ try:
     from docx import Document
     from docx.oxml.ns import qn
     from docx.oxml import OxmlElement
-    from lxml import etree
+
 except ImportError:
     print("ERROR: python-docx and lxml are required. Run: pip install python-docx lxml")
     sys.exit(1)
@@ -36,20 +36,26 @@ AUTHOR = os.environ.get("NDA_SKILL_REVIEWER_NAME", "Reviewer")
 DATE_STR = f"{date.today().isoformat()}T00:00:00Z"
 _id_counter = [0]
 
+# Tags of content-bearing paragraph children (removed when rebuilding a paragraph)
+_CONTENT_TAGS = None
+
 
 def _nid() -> str:
     _id_counter[0] += 1
     return str(_id_counter[0])
 
 
+def _content_tags() -> set:
+    global _CONTENT_TAGS
+    if _CONTENT_TAGS is None:
+        _CONTENT_TAGS = {qn("w:r"), qn("w:ins"), qn("w:del"), qn("w:hyperlink")}
+    return _CONTENT_TAGS
+
+
 # ── XML helpers ────────────────────────────────────────────────────────────────
 
-def _norm_run(text: str, bold: bool = False) -> "etree._Element":
+def _mk_run(text: str):
     r = OxmlElement("w:r")
-    if bold:
-        rpr = OxmlElement("w:rPr")
-        rpr.append(OxmlElement("w:b"))
-        r.append(rpr)
     t = OxmlElement("w:t")
     t.set(qn("xml:space"), "preserve")
     t.text = text
@@ -57,7 +63,7 @@ def _norm_run(text: str, bold: bool = False) -> "etree._Element":
     return r
 
 
-def _del_run(text: str) -> "etree._Element":
+def _mk_del(text: str):
     d = OxmlElement("w:del")
     d.set(qn("w:id"), _nid())
     d.set(qn("w:author"), AUTHOR)
@@ -71,41 +77,13 @@ def _del_run(text: str) -> "etree._Element":
     return d
 
 
-def _ins_run(text: str) -> "etree._Element":
+def _mk_ins(text: str):
     i = OxmlElement("w:ins")
     i.set(qn("w:id"), _nid())
     i.set(qn("w:author"), AUTHOR)
     i.set(qn("w:date"), DATE_STR)
-    r = OxmlElement("w:r")
-    t = OxmlElement("w:t")
-    t.set(qn("xml:space"), "preserve")
-    t.text = text
-    r.append(t)
-    i.append(r)
+    i.append(_mk_run(text))
     return i
-
-
-def _add_para(doc: Document, *segments: tuple) -> None:
-    """
-    Add a paragraph with mixed segments.
-    segments: (type, text) where type is 'n' (normal), 'b' (bold), 'd' (delete), 'i' (insert)
-    """
-    p = OxmlElement("w:p")
-    for typ, text in segments:
-        if typ == "n":
-            p.append(_norm_run(text))
-        elif typ == "b":
-            p.append(_norm_run(text, bold=True))
-        elif typ == "d":
-            p.append(_del_run(text))
-        elif typ == "i":
-            p.append(_ins_run(text))
-    doc.element.body.insert(len(doc.element.body) - 1, p)
-
-
-def _add_heading(doc: Document, text: str, level: int = 1) -> None:
-    p = doc.add_heading(text, level=level)
-    return p
 
 
 # ── Standard redline positions ─────────────────────────────────────────────────
@@ -126,10 +104,12 @@ STANDARD_REDLINES = [
         "id": "ci-oral",
         "clause": "CI Definition — Oral Disclosures",
         "priority": "HIGH",
-        "original": "(no written confirmation requirement for oral disclosures)",
-        "redlined": "For oral disclosures, Confidential Information shall include only information "
-                    "designated as confidential at the time of disclosure and confirmed in writing "
-                    "within ten (10) business days thereafter.",
+        "original": "",
+        "redlined": (
+            "For oral disclosures, Confidential Information shall include only information "
+            "designated as confidential at the time of disclosure and confirmed in writing "
+            "within ten (10) business days thereafter."
+        ),
         "rationale": (
             "Without a written confirmation window, any oral statement could retrospectively "
             "become Confidential Information, creating practical enforcement issues."
@@ -140,9 +120,11 @@ STANDARD_REDLINES = [
         "clause": "Permitted Disclosees — Professional Advisors",
         "priority": "HIGH",
         "original": "directors, officers, and employees",
-        "redlined": "directors, officers, employees, and professional advisors "
-                    "(including legal counsel, accountants, and financial advisors) who are "
-                    "bound by professional obligations of confidentiality",
+        "redlined": (
+            "directors, officers, employees, and professional advisors "
+            "(including legal counsel, accountants, and financial advisors) who are "
+            "bound by professional obligations of confidentiality"
+        ),
         "rationale": (
             "Professional advisors routinely need access to evaluate a transaction. "
             "Excluding them creates operational friction and is non-standard."
@@ -152,8 +134,8 @@ STANDARD_REDLINES = [
         "id": "return-destruction-election",
         "clause": "Return / Destruction — Party Election",
         "priority": "MEDIUM",
-        "original": "with the Disclosing Party's written consent, will either (a) return … or (b) destroy",
-        "redlined": "at the Receiving Party's election, either (a) return … or (b) destroy",
+        "original": "with the Disclosing Party's written consent, will either (a) return",
+        "redlined": "at the Receiving Party's election, either (a) return",
         "rationale": (
             "Requiring Disclosing Party consent for destruction removes the Receiving Party's "
             "ability to meet its own data-management obligations. Market standard is election."
@@ -163,11 +145,13 @@ STANDARD_REDLINES = [
         "id": "return-retention-exception",
         "clause": "Return / Destruction — Retention Exception",
         "priority": "MEDIUM",
-        "original": "(no exception for automated backup systems)",
-        "redlined": "Notwithstanding the foregoing, the Receiving Party shall not be required to "
-                    "return or destroy copies of Confidential Information held in automated backup "
-                    "systems, provided such copies are not accessible in the normal course of "
-                    "business and are overwritten in the Receiving Party's normal backup cycle.",
+        "original": "",
+        "redlined": (
+            "Notwithstanding the foregoing, the Receiving Party shall not be required to "
+            "return or destroy copies of Confidential Information held in automated backup "
+            "systems, provided such copies are not accessible in the normal course of "
+            "business and are overwritten in the Receiving Party's normal backup cycle."
+        ),
         "rationale": (
             "Without this carveout, complete return/destruction is technically impossible "
             "and creates residual legal exposure for the Receiving Party."
@@ -187,107 +171,178 @@ STANDARD_REDLINES = [
 ]
 
 
-# ── Document extraction ────────────────────────────────────────────────────────
+# ── In-place track change application ─────────────────────────────────────────
 
-def extract_text_from_docx(path: Path) -> str:
-    """Extract plain text from a DOCX file."""
-    import zipfile
-    try:
-        with zipfile.ZipFile(str(path)) as z:
-            with z.open("word/document.xml") as f:
-                xml = f.read().decode("utf-8")
-                text = re.sub(r"<[^>]+>", " ", xml)
-                return re.sub(r"\s+", " ", text).strip()
-    except Exception as e:
-        return f"(extraction failed: {e})"
+def _para_full_text(para) -> str:
+    """Concatenate text from all direct runs in a paragraph."""
+    return "".join(run.text for run in para.runs)
 
 
-def extract_text(path: Path) -> str:
-    suffix = path.suffix.lower()
-    if suffix == ".docx":
-        return extract_text_from_docx(path)
-    elif suffix in (".md", ".txt"):
-        try:
-            return path.read_text()
-        except OSError as e:
-            return f"(read failed: {e})"
-    else:
-        try:
-            return path.read_text(errors="replace")
-        except OSError as e:
-            return f"(read failed: {e})"
+def _apply_change_to_para(para, original: str, redlined: str) -> bool:
+    """
+    If para contains original, rebuild paragraph XML with track changes in-place:
+      pre-match text → w:del(original) → w:ins(redlined) → post-match text
+
+    Content-bearing children (w:r, w:ins, w:del, w:hyperlink) are replaced;
+    structural elements (w:pPr, w:bookmarkStart, w:bookmarkEnd) are preserved.
+
+    Returns True if applied, False if original not found in this paragraph.
+    """
+    full_text = _para_full_text(para)
+    if original not in full_text:
+        return False
+
+    idx = full_text.index(original)
+    pre = full_text[:idx]
+    post = full_text[idx + len(original):]
+
+    p_elem = para._p
+    tags = _content_tags()
+
+    # Remove content-bearing children; keep pPr, bookmarks, sectPr, etc.
+    for child in list(p_elem):
+        if child.tag in tags:
+            p_elem.remove(child)
+
+    if pre:
+        p_elem.append(_mk_run(pre))
+    if original:
+        p_elem.append(_mk_del(original))
+    if redlined:
+        p_elem.append(_mk_ins(redlined))
+    if post:
+        p_elem.append(_mk_run(post))
+
+    return True
+
+
+def _iter_paragraphs(doc) -> list:
+    """Return all paragraphs from body and table cells, deduplicated.
+
+    Merged table cells share the same underlying XML node; deduplicating by
+    id(para._p) prevents the same change being applied twice.
+    """
+    seen: set = set()
+    paras: list = []
+
+    def _add(para):
+        key = id(para._p)
+        if key not in seen:
+            seen.add(key)
+            paras.append(para)
+
+    for para in doc.paragraphs:
+        _add(para)
+    for table in doc.tables:
+        for row in table.rows:
+            for cell in row.cells:
+                for para in cell.paragraphs:
+                    _add(para)
+    return paras
+
+
+def _is_placeholder_original(original: str) -> bool:
+    """True if original is empty or a descriptive placeholder (not literal NDA text)."""
+    return not original or original.strip().startswith("(")
 
 
 # ── Redline document generation ────────────────────────────────────────────────
 
 def generate_redline_doc(
     source_path: Path,
-    issues: list[dict],
-    output_path: Path | None = None,
+    issues: list,
+    output_path: Path = None,
 ) -> Path:
     """
-    Generate a track-changes DOCX.
+    Open source DOCX and apply track changes in-place.
+
+    For each issue:
+    - Searches all paragraphs for issue['original'] (exact substring match)
+    - Replaces matched text with w:del + w:ins XML
+    - Issues where original is empty or a placeholder, or where the text is not
+      found, are collected and appended as a [MANUAL REDLINE NEEDED] section.
 
     issues: list of dicts with keys: id, clause, priority, original, redlined, rationale
     """
-    doc = Document()
+    try:
+        doc = Document(str(source_path))
+    except Exception as e:
+        print(f"ERROR: Could not open DOCX file {source_path}: {e}", file=sys.stderr)
+        sys.exit(1)
     today = date.today().strftime("%Y%m%d")
     reviewer = AUTHOR.replace(" ", "_")
 
     if output_path is None:
         output_path = source_path.parent / f"NDA_Redlined_{reviewer}_{today}.docx"
 
-    # Cover heading
-    doc.add_heading("NDA — Redlined Version", 0)
-    doc.add_paragraph(f"Reviewer: {AUTHOR} | Date: {date.today().isoformat()}")
-    doc.add_paragraph(f"Source: {source_path.name}")
-    doc.add_paragraph("")
+    all_paras = _iter_paragraphs(doc)
+    unmatched = []
+    matched_count = 0
 
-    doc.add_heading("Track Changes Summary", 1)
-    doc.add_paragraph(
-        f"This document contains {len(issues)} proposed change(s). "
-        "Items marked in red are deletions; items in green are insertions. "
-        "Please accept or reject each change using Word's Review → Accept/Reject feature."
-    )
-    doc.add_paragraph("")
-
-    # One section per issue
     for issue in issues:
-        _add_heading(doc, f"[{issue['priority']}] {issue['clause']}", level=2)
+        original = issue.get("original", "")
+        redlined = issue.get("redlined", "")
 
-        # Rationale line
-        doc.add_paragraph(f"Rationale: {issue['rationale']}")
+        if _is_placeholder_original(original):
+            # Pure insertion — no text to locate, flag for manual placement
+            unmatched.append(issue)
+            continue
 
-        # Proposed change with track-change markup
-        _add_para(doc,
-            ("b", "Proposed change: "),
-            ("d", issue["original"]),
-            ("n", " → "),
-            ("i", issue["redlined"]),
+        applied = False
+        for para in all_paras:
+            if _apply_change_to_para(para, original, redlined):
+                applied = True
+                matched_count += 1
+                break  # apply to first matching paragraph only
+
+        if not applied:
+            unmatched.append(issue)
+
+    # ── Fallback section for unmatched / pure-insertion changes ───────────────
+    if unmatched:
+        doc.add_paragraph("─" * 60)
+
+        h = doc.add_paragraph()
+        h.add_run("[MANUAL REDLINE NEEDED]").bold = True
+
+        doc.add_paragraph(
+            f"The following {len(unmatched)} change(s) could not be automatically "
+            "located in the document text. Please apply them manually:"
         )
-        doc.add_paragraph("")
 
-    # Signature block placeholder
-    doc.add_heading("Signature Block", 1)
-    doc.add_paragraph("[Parties' signature lines — unchanged from original]")
+        for issue in unmatched:
+            p = doc.add_paragraph()
+            p.add_run(f"[{issue.get('priority', '?')}] {issue.get('clause', '')}: ").bold = True
+            orig = issue.get("original", "")
+            if orig and not _is_placeholder_original(orig):
+                p._p.append(_mk_del(orig))
+                p._p.append(_mk_run(" → "))
+            p._p.append(_mk_ins(issue.get("redlined", "")))
+
+            rationale = issue.get("rationale", "")
+            if rationale:
+                doc.add_paragraph(f"  Rationale: {rationale}")
 
     try:
         doc.save(str(output_path))
     except OSError as e:
         print(f"ERROR: Could not save output file {output_path}: {e}", file=sys.stderr)
         sys.exit(1)
+
     return output_path
 
 
 # ── CLI ────────────────────────────────────────────────────────────────────────
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Generate NDA redline DOCX with track changes")
-    parser.add_argument("--source",      required=True, help="Path to source NDA file (.docx/.md)")
-    parser.add_argument("--issues",      default="",    help="Path to JSON issues file")
-    parser.add_argument("--output",      default="",    help="Output DOCX path (auto-named if omitted)")
-    parser.add_argument("--all-standard",action="store_true",
-                        help="Apply all standard redline positions without interactive selection")
+    parser = argparse.ArgumentParser(
+        description="Apply NDA track-changes to source DOCX in-place"
+    )
+    parser.add_argument("--source",       required=True, help="Path to source NDA file (.docx)")
+    parser.add_argument("--issues",       default="",    help="Path to JSON issues file")
+    parser.add_argument("--output",       default="",    help="Output DOCX path (auto-named if omitted)")
+    parser.add_argument("--all-standard", action="store_true",
+                        help="Apply all standard redline positions")
     args = parser.parse_args()
 
     source = Path(args.source).expanduser()
@@ -303,23 +358,35 @@ def main() -> None:
         except FileNotFoundError:
             print(f"ERROR: Issues file not found: {issues_path}", file=sys.stderr)
             sys.exit(1)
+        except PermissionError:
+            print(f"ERROR: Permission denied reading: {issues_path}", file=sys.stderr)
+            sys.exit(1)
+        except UnicodeDecodeError as e:
+            print(f"ERROR: Issues file is not valid UTF-8: {e}", file=sys.stderr)
+            sys.exit(1)
         except json.JSONDecodeError as e:
             print(f"ERROR: Issues file is not valid JSON: {e}", file=sys.stderr)
+            sys.exit(1)
+        if not isinstance(issues, list):
+            print(f"ERROR: Issues file must contain a JSON array, got {type(issues).__name__}", file=sys.stderr)
             sys.exit(1)
     elif args.all_standard:
         issues = STANDARD_REDLINES
     else:
-        # Default to all standard positions
         print(f"No --issues file provided. Applying {len(STANDARD_REDLINES)} standard redline positions.")
         issues = STANDARD_REDLINES
 
     output = Path(args.output).expanduser() if args.output else None
     out_path = generate_redline_doc(source, issues, output)
 
+    manual_count = sum(1 for i in issues if _is_placeholder_original(i.get("original", "")))
+    eligible_count = len(issues) - manual_count
+
     print(f"✅ Redlined document generated: {out_path}")
-    print(f"   Changes applied: {len(issues)}")
+    print(f"   In-place eligible: {eligible_count} | Manual section: {manual_count}")
     for issue in issues:
-        print(f"   [{issue['priority']}] {issue['clause']}")
+        tag = "(manual)" if _is_placeholder_original(issue.get("original", "")) else ""
+        print(f"   [{issue['priority']}] {issue['clause']} {tag}".rstrip())
 
 
 if __name__ == "__main__":

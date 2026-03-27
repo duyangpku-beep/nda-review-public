@@ -210,6 +210,39 @@ Your choice (A / B / C / D / skip / stop):
     - Focus: Does the NDA have a residuals clause permitting use of unaided memory?
     - Receiving Party benefit / Disclosing Party risk: trade secret implications
 
+### Step 3b: Handling Option D — free-text custom position
+
+When the user selects **D**, do NOT offer a sub-menu or template. Instead, prompt
+for free-form input across three fields:
+
+```
+D selected. Tell me exactly what your position is for this clause:
+
+Standard position (what you push for first):
+> [user types freely]
+
+Acceptable fallback (what you'll accept if pushed back):
+> [user types freely — or press Enter to skip]
+
+Walk-away / red line (what you will never accept):
+> [user types freely — or press Enter to skip]
+```
+
+Then confirm back **before saving**:
+
+```
+Here's what I'll record:
+  Standard:  "[their text]"
+  Fallback:  "[their text or '(not set)']"
+  Walk-away: "[their text or '(not set)']"
+
+Save this? (yes / edit / skip)
+```
+
+- **yes** → proceed to save (Step 4 below)
+- **edit** → return to the free-text prompts above
+- **skip** → move to next clause without saving
+
 ### Step 4: Save positions
 After each confirmed choice (A/B/C/D), call:
 ```bash
@@ -242,6 +275,39 @@ Your playbook is saved at: ~/.nda-skill/playbook/NDA/
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 ```
+
+### Step 5b: Extra clauses
+
+After the summary, prompt:
+
+```
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+➕ Want to add any additional clause positions?
+   (These will also be saved to your playbook.)
+
+Enter clause name (or 'done' to finish):
+```
+
+For each custom clause name entered (until the user types `done`):
+1. Use the same free-text input + confirmation flow as Step 3b (Option D):
+   - Prompt for Standard, Fallback, Walk-Away
+   - Confirm before saving
+2. Ask for Priority (High / Medium / Low) and Category (Confidentiality / Governance / Term / General)
+3. On confirmation "yes", save with:
+```bash
+python3 ~/.nda-skill/scripts/playbook.py \
+  --save \
+  --clause "[CUSTOM CLAUSE NAME]" \
+  --doc-type NDA \
+  --standard "[their text]" \
+  --fallback "[their text or empty]" \
+  --walkaway "[their text or empty]" \
+  --notes "Added via learn session" \
+  --priority [High|Medium|Low] \
+  --category "[Category]" \
+  --perspective [receiving|disclosing]
+```
+4. After saving, prompt for the next clause name (or 'done').
 
 Then ask: "Would you like to sync this playbook to your configured notebook? (yes/no)"
 If yes, run Mode D (--sync).
@@ -391,12 +457,45 @@ Would you like to generate a track-changes Word document with these redlines?
 Generate redlined DOCX? (yes/no)
 ```
 
-If yes:
+If yes, write the actual triage findings to a JSON file, then pass it to the
+generator. Claude must use the **exact text found in the NDA** as `original`
+(copy from the REDLINE SUGGESTIONS section of the triage report above).
+For pure insertions (no text to delete), set `original` to `""`.
+
 ```bash
+python3 - << 'PYEOF'
+import json, pathlib
+
+# Populate from actual triage findings above.
+# 'original' must be the exact substring from the NDA — not a generic template.
+# Leave original="" for pure insertions (oral CI confirmation, retention exception, etc.)
+issues = [
+  {
+    "id": "ci-temporal",
+    "clause": "CI Definition — Temporal Scope",
+    "priority": "HIGH",
+    "original": "[EXACT TEXT FROM NDA — e.g. 'whether before or after the date of this Agreement']",
+    "redlined": "on or after the date of this Agreement",
+    "rationale": "Pre-signing disclosures create unbounded historical liability."
+  },
+  # Add one entry per HIGH/MEDIUM issue identified in the triage report.
+  # Remove issues not found in this NDA.
+]
+
+p = pathlib.Path("/tmp/nda_issues.json")
+p.write_text(json.dumps(issues, indent=2))
+print(p)
+PYEOF
+
 python3 ~/.nda-skill/scripts/generate_redline.py \
   --source "{{NDA_PATH}}" \
-  --all-standard
+  --issues /tmp/nda_issues.json
 ```
+
+**Important**: Replace each `[EXACT TEXT FROM NDA — ...]` placeholder with the
+literal phrase extracted from the NDA during triage. Issues whose text could not
+be located will automatically appear in a `[MANUAL REDLINE NEEDED]` section at
+the end of the output document.
 
 Report the output file path to the user.
 
